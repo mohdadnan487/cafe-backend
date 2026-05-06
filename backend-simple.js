@@ -3,6 +3,16 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 require('dotenv').config();
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -164,35 +174,32 @@ app.get('/api/stats', (req, res) => {
   );
 });
 
-// Upload menu PDF URL
-app.post('/api/upload-menu', (req, res) => {
-  const { pdf_url } = req.body;
-  db.run(
-    `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`,
-    () => {
-      db.run(
-        `INSERT OR REPLACE INTO settings (key, value) VALUES ('menu_pdf_url', ?)`,
-        [pdf_url],
-        (err) => {
-          if (err) return res.status(500).json({ error: 'Failed to save URL' });
-          res.json({ success: true });
-        }
-      );
-    }
-  );
+// Upload menu PDF
+app.post('/api/upload-menu', upload.single('pdf'), async (req, res) => {
+  try {
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload_stream(
+        { resource_type: 'raw', folder: 'cafe-menu', format: 'pdf' },
+        (error, result) => error ? reject(error) : resolve(result)
+      ).end(req.file.buffer);
+    });
+    db.run(
+      `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`,
+      () => {
+        db.run(
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('menu_pdf_url', ?)`,
+          [result.secure_url],
+          (err) => {
+            if (err) return res.status(500).json({ error: 'Failed to save URL' });
+            res.json({ success: true, url: result.secure_url });
+          }
+        );
+      }
+    );
+  } catch (err) {
+    res.status(500).json({ error: 'Upload failed: ' + err.message });
+  }
 });
-
-// Get menu PDF URL
-app.get('/api/menu-pdf-url', (req, res) => {
-  db.get(
-    `SELECT value FROM settings WHERE key = 'menu_pdf_url'`,
-    (err, row) => {
-      if (err || !row) return res.json({ url: null });
-      res.json({ url: row.value });
-    }
-  );
-});
-
 
 // Health check
 app.get('/api/health', (req, res) => {
