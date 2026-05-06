@@ -164,6 +164,36 @@ app.get('/api/stats', (req, res) => {
   );
 });
 
+// Upload menu PDF URL
+app.post('/api/upload-menu', (req, res) => {
+  const { pdf_url } = req.body;
+  db.run(
+    `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`,
+    () => {
+      db.run(
+        `INSERT OR REPLACE INTO settings (key, value) VALUES ('menu_pdf_url', ?)`,
+        [pdf_url],
+        (err) => {
+          if (err) return res.status(500).json({ error: 'Failed to save URL' });
+          res.json({ success: true });
+        }
+      );
+    }
+  );
+});
+
+// Get menu PDF URL
+app.get('/api/menu-pdf-url', (req, res) => {
+  db.get(
+    `SELECT value FROM settings WHERE key = 'menu_pdf_url'`,
+    (err, row) => {
+      if (err || !row) return res.json({ url: null });
+      res.json({ url: row.value });
+    }
+  );
+});
+
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
