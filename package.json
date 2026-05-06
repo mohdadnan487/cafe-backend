@@ -1,0 +1,14 @@
+{
+  "name": "cafe-backend",
+  "version": "1.0.0",
+  "main": "backend-simple.js",
+  "scripts": {
+    "start": "node backend-simple.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "sqlite3": "^5.1.6",
+    "dotenv": "^16.0.3"
+  }
+}
