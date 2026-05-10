@@ -275,4 +275,51 @@ app.get('/api/vendor/stats', authMiddleware, (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const { WebSocketServer } = require('ws');
+const http = require('http');
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+const groupOrders = {};
+
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://localhost`);
+  const groupId = url.searchParams.get('groupId');
+  const userName = url.searchParams.get('name') || 'Guest';
+
+  if (!groupId) return ws.close();
+
+  if (!groupOrders[groupId]) groupOrders[groupId] = { cart: [], members: [] };
+  
+  groupOrders[groupId].members.push({ ws, name: userName });
+
+  ws.send(JSON.stringify({ type: 'init', cart: groupOrders[groupId].cart, members: groupOrders[groupId].members.map(m => m.name) }));
+
+  const broadcast = (groupId, data) => {
+    groupOrders[groupId]?.members.forEach(m => {
+      if (m.ws.readyState === 1) m.ws.send(JSON.stringify(data));
+    });
+  };
+
+  ws.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data.type === 'update_cart') {
+        groupOrders[groupId].cart = data.cart;
+        broadcast(groupId, { type: 'cart_updated', cart: data.cart, updatedBy: userName });
+      }
+    } catch (err) {}
+  });
+
+  ws.on('close', () => {
+    if (groupOrders[groupId]) {
+      groupOrders[groupId].members = groupOrders[groupId].members.filter(m => m.ws !== ws);
+      if (groupOrders[groupId].members.length === 0) delete groupOrders[groupId];
+      else broadcast(groupId, { type: 'member_left', members: groupOrders[groupId].members.map(m => m.name) });
+    }
+  });
+
+  broadcast(groupId, { type: 'member_joined', name: userName, members: groupOrders[groupId].members.map(m => m.name) });
+});
+
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
