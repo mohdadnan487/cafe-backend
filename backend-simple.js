@@ -2,9 +2,15 @@ const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-require('dotenv').config();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'foodquarter_secret_2024';
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -14,200 +20,258 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json());
 
-// Initialize SQLite database
-const dbPath = path.join(__dirname, 'cafe.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) console.error('Database error:', err);
-  else {
-    console.log('Connected to SQLite database');
-    initializeDatabase();
-  }
+const db = new sqlite3.Database(path.join(__dirname, 'cafe.db'));
+
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS vendors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    description TEXT,
+    logo_url TEXT,
+    cuisine TEXT,
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS menu_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    price REAL NOT NULL,
+    image_url TEXT,
+    category TEXT,
+    is_available INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (vendor_id) REFERENCES vendors(id)
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_id INTEGER NOT NULL,
+    table_number INTEGER NOT NULL,
+    customer_name TEXT,
+    status TEXT DEFAULT 'new',
+    total REAL NOT NULL,
+    payment_status TEXT DEFAULT 'paid',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (vendor_id) REFERENCES vendors(id)
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    menu_item_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    price REAL NOT NULL,
+    quantity INTEGER NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders(id)
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS waiter_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_number INTEGER NOT NULL,
+    vendor_id INTEGER,
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  )`);
 });
 
-function initializeDatabase() {
-  db.serialize(() => {
-    // Service requests table
-    db.run(`CREATE TABLE IF NOT EXISTS service_requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      table_number INTEGER NOT NULL,
-      request_type TEXT NOT NULL,
-      status TEXT DEFAULT 'pending',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+// ===== AUTH MIDDLEWARE =====
+const authMiddleware = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    req.vendor = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
 
-    // Google reviews table
-    db.run(`CREATE TABLE IF NOT EXISTS reviews (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      rating INTEGER NOT NULL,
-      comment TEXT,
-      table_number INTEGER,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+// ===== VENDOR AUTH =====
+app.post('/api/vendor/register', async (req, res) => {
+  const { name, email, password, description, cuisine } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
+  const hashed = await bcrypt.hash(password, 10);
+  db.run(
+    'INSERT INTO vendors (name, email, password, description, cuisine) VALUES (?, ?, ?, ?, ?)',
+    [name, email, hashed, description, cuisine],
+    function(err) {
+      if (err) return res.status(400).json({ error: 'Email already exists' });
+      const token = jwt.sign({ id: this.lastID, email, name }, JWT_SECRET);
+      res.json({ token, vendor: { id: this.lastID, name, email, description, cuisine } });
+    }
+  );
+});
 
-    // QR sessions table
-    db.run(`CREATE TABLE IF NOT EXISTS qr_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      table_number INTEGER NOT NULL UNIQUE,
-      session_code TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-    console.log('Database initialized successfully');
+app.post('/api/vendor/login', (req, res) => {
+  const { email, password } = req.body;
+  db.get('SELECT * FROM vendors WHERE email = ?', [email], async (err, vendor) => {
+    if (!vendor) return res.status(401).json({ error: 'Invalid credentials' });
+    const valid = await bcrypt.compare(password, vendor.password);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: vendor.id, email: vendor.email, name: vendor.name }, JWT_SECRET);
+    res.json({ token, vendor: { id: vendor.id, name: vendor.name, email: vendor.email, description: vendor.description, cuisine: vendor.cuisine, logo_url: vendor.logo_url } });
   });
-}
+});
+
+app.get('/api/vendor/me', authMiddleware, (req, res) => {
+  db.get('SELECT id, name, email, description, cuisine, logo_url FROM vendors WHERE id = ?', [req.vendor.id], (err, vendor) => {
+    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+    res.json(vendor);
+  });
+});
+
+// ===== MENU MANAGEMENT =====
+app.get('/api/vendor/menu', authMiddleware, (req, res) => {
+  db.all('SELECT * FROM menu_items WHERE vendor_id = ? ORDER BY category, name', [req.vendor.id], (err, items) => {
+    res.json(items || []);
+  });
+});
+
+app.post('/api/vendor/menu', authMiddleware, upload.single('image'), async (req, res) => {
+  const { name, description, price, category } = req.body;
+  let image_url = null;
+  if (req.file) {
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload_stream({ folder: 'food-quarter' }, (err, result) => err ? reject(err) : resolve(result)).end(req.file.buffer);
+    });
+    image_url = result.secure_url;
+  }
+  db.run(
+    'INSERT INTO menu_items (vendor_id, name, description, price, image_url, category) VALUES (?, ?, ?, ?, ?, ?)',
+    [req.vendor.id, name, description, price, image_url, category],
+    function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to add item' });
+      res.json({ id: this.lastID, name, description, price, image_url, category, is_available: 1 });
+    }
+  );
+});
+
+app.put('/api/vendor/menu/:id', authMiddleware, upload.single('image'), async (req, res) => {
+  const { name, description, price, category, is_available } = req.body;
+  let image_url = req.body.image_url;
+  if (req.file) {
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload_stream({ folder: 'food-quarter' }, (err, result) => err ? reject(err) : resolve(result)).end(req.file.buffer);
+    });
+    image_url = result.secure_url;
+  }
+  db.run(
+    'UPDATE menu_items SET name=?, description=?, price=?, category=?, image_url=?, is_available=? WHERE id=? AND vendor_id=?',
+    [name, description, price, category, image_url, is_available, req.params.id, req.vendor.id],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'Failed to update item' });
+      res.json({ success: true });
+    }
+  );
+});
+
+app.delete('/api/vendor/menu/:id', authMiddleware, (req, res) => {
+  db.run('DELETE FROM menu_items WHERE id=? AND vendor_id=?', [req.params.id, req.vendor.id], (err) => {
+    if (err) return res.status(500).json({ error: 'Failed to delete item' });
+    res.json({ success: true });
+  });
+});
+
+// ===== ORDER MANAGEMENT =====
+app.get('/api/vendor/orders', authMiddleware, (req, res) => {
+  db.all(
+    `SELECT o.*, GROUP_CONCAT(oi.quantity || 'x ' || oi.name) as items_summary
+     FROM orders o
+     LEFT JOIN order_items oi ON o.id = oi.order_id
+     WHERE o.vendor_id = ?
+     GROUP BY o.id
+     ORDER BY o.created_at DESC LIMIT 50`,
+    [req.vendor.id],
+    (err, orders) => res.json(orders || [])
+  );
+});
+
+app.put('/api/vendor/orders/:id', authMiddleware, (req, res) => {
+  const { status } = req.body;
+  db.run('UPDATE orders SET status=? WHERE id=? AND vendor_id=?', [status, req.params.id, req.vendor.id], (err) => {
+    if (err) return res.status(500).json({ error: 'Failed to update order' });
+    res.json({ success: true });
+  });
+});
 
 // ===== CUSTOMER ENDPOINTS =====
-
-// Get menu
-app.get('/api/menu', (req, res) => {
-  const menu = {
-    cafe_name: 'The Blue Cup Cafe',
-    categories: {
-      'Hot Drinks': [
-        { name: 'Cappuccino', price: '£3.50' },
-        { name: 'Latte', price: '£3.80' },
-        { name: 'Espresso', price: '£2.50' },
-        { name: 'Americano', price: '£2.80' }
-      ],
-      'Cold Drinks': [
-        { name: 'Iced Coffee', price: '£3.50' },
-        { name: 'Cold Brew', price: '£3.20' },
-        { name: 'Iced Tea', price: '£2.50' }
-      ],
-      'Pastries': [
-        { name: 'Croissant', price: '£2.20' },
-        { name: 'Muffin', price: '£2.50' },
-        { name: 'Bagel', price: '£2.00' },
-        { name: 'Chocolate Cake', price: '£3.50' }
-      ]
-    }
-  };
-  res.json(menu);
+app.get('/api/vendors', (req, res) => {
+  db.all('SELECT id, name, description, cuisine, logo_url FROM vendors WHERE is_active=1', (err, vendors) => {
+    res.json(vendors || []);
+  });
 });
 
-// Submit service request
-app.post('/api/service-request', (req, res) => {
-  const { table_number, request_type } = req.body;
+app.get('/api/vendors/:id/menu', (req, res) => {
+  db.all('SELECT * FROM menu_items WHERE vendor_id=? AND is_available=1 ORDER BY category, name', [req.params.id], (err, items) => {
+    res.json(items || []);
+  });
+});
+
+app.post('/api/orders', (req, res) => {
+  const { vendor_id, table_number, items, total, customer_name } = req.body;
   db.run(
-    'INSERT INTO service_requests (table_number, request_type) VALUES (?, ?)',
-    [table_number, request_type],
+    'INSERT INTO orders (vendor_id, table_number, customer_name, total) VALUES (?, ?, ?, ?)',
+    [vendor_id, table_number, customer_name, total],
     function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to submit request' });
-      res.json({ success: true, id: this.lastID });
+      if (err) return res.status(500).json({ error: 'Failed to place order' });
+      const orderId = this.lastID;
+      const stmt = db.prepare('INSERT INTO order_items (order_id, menu_item_id, name, price, quantity) VALUES (?, ?, ?, ?, ?)');
+      items.forEach(item => stmt.run([orderId, item.id, item.name, item.price, item.quantity]));
+      stmt.finalize();
+      res.json({ success: true, order_id: orderId });
     }
   );
 });
 
-// Submit review
-app.post('/api/review', (req, res) => {
-  const { rating, comment, table_number } = req.body;
-  db.run(
-    'INSERT INTO reviews (rating, comment, table_number) VALUES (?, ?, ?)',
-    [rating, comment, table_number],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to submit review' });
-      res.json({ success: true });
-    }
-  );
+app.post('/api/waiter-request', (req, res) => {
+  const { table_number, vendor_id } = req.body;
+  db.run('INSERT INTO waiter_requests (table_number, vendor_id) VALUES (?, ?)', [table_number, vendor_id], function(err) {
+    if (err) return res.status(500).json({ error: 'Failed to submit request' });
+    res.json({ success: true });
+  });
 });
 
-// ===== WAITER ENDPOINTS =====
-
-// Get pending service requests
-app.get('/api/pending-requests', (req, res) => {
+app.get('/api/vendor/waiter-requests', authMiddleware, (req, res) => {
   db.all(
-    `SELECT id, table_number, request_type, created_at 
-     FROM service_requests 
-     WHERE status = 'pending' 
-     ORDER BY created_at DESC`,
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Failed to fetch requests' });
-      res.json(rows || []);
-    }
+    `SELECT * FROM waiter_requests WHERE (vendor_id=? OR vendor_id IS NULL) AND status='pending' ORDER BY created_at DESC`,
+    [req.vendor.id],
+    (err, rows) => res.json(rows || [])
   );
 });
 
-// Mark request as complete
-app.post('/api/complete-request/:id', (req, res) => {
-  db.run(
-    'UPDATE service_requests SET status = ? WHERE id = ?',
-    ['completed', req.params.id],
-    (err) => {
-      if (err) return res.status(500).json({ error: 'Failed to complete request' });
-      res.json({ success: true });
-    }
-  );
+app.put('/api/vendor/waiter-requests/:id', authMiddleware, (req, res) => {
+  db.run('UPDATE waiter_requests SET status="done" WHERE id=?', [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: 'Failed' });
+    res.json({ success: true });
+  });
 });
 
-// Get recent reviews
-app.get('/api/reviews', (req, res) => {
-  db.all(
-    `SELECT rating, comment, table_number, created_at 
-     FROM reviews 
-     ORDER BY created_at DESC 
-     LIMIT 50`,
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Failed to fetch reviews' });
-      res.json(rows || []);
-    }
-  );
-});
-
-// Get dashboard stats
-app.get('/api/stats', (req, res) => {
-  db.all(
+app.get('/api/vendor/stats', authMiddleware, (req, res) => {
+  db.get(
     `SELECT 
-       (SELECT COUNT(*) FROM service_requests WHERE status = 'pending') as pending,
-       (SELECT COUNT(*) FROM service_requests WHERE status = 'completed' AND DATE(created_at) = DATE('now')) as completed_today,
-       (SELECT AVG(rating) FROM reviews) as avg_rating`,
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Failed to fetch stats' });
-      const stats = rows[0] || { pending: 0, completed_today: 0, avg_rating: 0 };
-      res.json(stats);
-    }
+      COUNT(CASE WHEN status='new' THEN 1 END) as new_orders,
+      COUNT(CASE WHEN status='preparing' THEN 1 END) as preparing,
+      COUNT(CASE WHEN DATE(created_at)=DATE('now') THEN 1 END) as today_orders,
+      SUM(CASE WHEN DATE(created_at)=DATE('now') THEN total ELSE 0 END) as today_revenue
+     FROM orders WHERE vendor_id=?`,
+    [req.vendor.id],
+    (err, stats) => res.json(stats || {})
   );
 });
 
-// Upload menu PDF
-app.post('/api/upload-menu', upload.single('pdf'), async (req, res) => {
-  try {
-    const result = await new Promise((resolve, reject) => {
-      cloudinary.uploader.upload_stream(
-        { resource_type: 'raw', folder: 'cafe-menu', format: 'pdf' },
-        (error, result) => error ? reject(error) : resolve(result)
-      ).end(req.file.buffer);
-    });
-    db.run(
-      `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`,
-      () => {
-        db.run(
-          `INSERT OR REPLACE INTO settings (key, value) VALUES ('menu_pdf_url', ?)`,
-          [result.secure_url],
-          (err) => {
-            if (err) return res.status(500).json({ error: 'Failed to save URL' });
-            res.json({ success: true, url: result.secure_url });
-          }
-        );
-      }
-    );
-  } catch (err) {
-    res.status(500).json({ error: 'Upload failed: ' + err.message });
-  }
-});
+app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-app.listen(PORT, () => {
-  console.log(`\nServer running on port ${PORT}`);
-  console.log(`Customer App: http://localhost:3001`);
-  console.log(`API: http://localhost:${PORT}/api\n`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
