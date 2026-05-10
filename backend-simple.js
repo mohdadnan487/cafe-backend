@@ -210,7 +210,8 @@ app.put('/api/vendor/orders/:id', authMiddleware, (req, res) => {
 // ===== CUSTOMER ENDPOINTS =====
 app.get('/api/vendors', (req, res) => {
   db.all('SELECT id, name, description, cuisine, logo_url FROM vendors WHERE is_active=1', (err, vendors) => {
-    res.json(vendors || []);
+    const result = (vendors || []).map(v => ({...v, is_open: true, wait_time: 15}));
+    res.json(result);
   });
 });
 
